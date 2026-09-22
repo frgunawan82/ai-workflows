@@ -21,6 +21,9 @@ jobs:
           ./scripts/install.sh --home "$H"
           for f in \
             "$H/.agents/workflows/work-with-workflow/list_workflows.py" \
+            "$H/.agents/workflows/work-with-workflow/check_workflow.py" \
+            "$H/.agents/guidelines/list_guidelines.py" \
+            "$H/.agents/guidelines/check_guideline.py" \
             "$H/.pi/agent/AGENTS.md" \
             "$H/.codex/AGENTS.md" \
             "$H/.opencode/AGENTS.md" \
@@ -30,8 +33,12 @@ jobs:
             test -f "$f" || { echo "missing after install: $f" >&2; exit 1; }
           done
           cmp -s AGENTS.md "$H/.claude/CLAUDE.md" || { echo "CLAUDE.md differs from AGENTS.md" >&2; exit 1; }
-          test -z "$(find "$H/.agents/workflows" -name '__pycache__' -o -name '.pytest_cache')" \
+          test -z "$(find "$H/.agents/workflows" "$H/.agents/guidelines" -name '__pycache__' -o -name '.pytest_cache')" \
             || { echo "build artifacts were installed" >&2; exit 1; }
+      - name: shipped AGENTS.md guideline block matches shipped guidelines
+        run: |
+          H="$RUNNER_TEMP/home"
+          HOME="$H" python3 "$H/.agents/guidelines/list_guidelines.py" --check
       - name: re-run is idempotent and preserves secrets
         run: |
           H="$RUNNER_TEMP/home"
@@ -53,6 +60,17 @@ jobs:
             exit 1
           fi
           echo "OK: no credential files tracked"
+
+  lint:
+    name: workflows and guidelines conform to their standards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python workflows/work-with-workflow/check_workflow.py workflows
+      - run: python guidelines/check_guideline.py guidelines
 
   tests:
     name: python tests

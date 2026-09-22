@@ -7,6 +7,7 @@
 #
 # What it does:
 #   workflows/         -> $HOME/.agents/workflows/
+#   guidelines/        -> $HOME/.agents/guidelines/
 #   AGENTS.md          -> $HOME/.pi/agent/AGENTS.md
 #                         $HOME/.codex/AGENTS.md
 #                         $HOME/.opencode/AGENTS.md
@@ -100,6 +101,16 @@ if [ "$DRY" -eq 0 ]; then
 	find "$WF_DEST" \( -name '__pycache__' -o -name '.pytest_cache' \) -type d -prune -exec rm -rf {} + 2>/dev/null || true
 fi
 
+# ── guidelines ───────────────────────────────────────────────────────────────
+GL_DEST="$DEST/.agents/guidelines"
+backup "$GL_DEST"
+say "install $GL_DEST"
+if [ "$DRY" -eq 0 ]; then
+	mkdir -p "$DEST/.agents"
+	cp -R "$REPO/guidelines" "$GL_DEST"
+	find "$GL_DEST" \( -name '__pycache__' -o -name '.pytest_cache' \) -type d -prune -exec rm -rf {} + 2>/dev/null || true
+fi
+
 # ── agent instructions: one source file, four harness locations ──────────────
 AGENTS="$REPO/AGENTS.md"
 [ -f "$AGENTS" ] || { echo "missing $AGENTS" >&2; exit 1; }
@@ -127,6 +138,7 @@ Next:
   3. Several workflows expect a Python env at $DEST/.agents/.venv:
        python3 -m venv $DEST/.agents/.venv
 
-List the installed workflows:
+List the installed workflows and guidelines:
   $DEST/.agents/.venv/bin/python $WF_DEST/work-with-workflow/list_workflows.py
+  $DEST/.agents/.venv/bin/python $GL_DEST/list_guidelines.py
 EOF

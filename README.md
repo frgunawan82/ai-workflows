@@ -27,7 +27,9 @@ conversation, and no per-tool context budget caps how much you can accumulate.
 **Extend it freely.** Add as many workflows as you need — your own team conventions,
 your deploy ritual, your review checklist. Drop a folder in `~/.agents/workflows/`,
 or commit one to a project's `.agents/workflows/` where it shadows the global version
-for that repo only. `work-with-workflow` is the workflow for writing workflows.
+for that repo only. `work-with-workflow` is the workflow for writing workflows, and
+`work-with-guideline` is its counterpart for [guidelines](#guidelines) — the rule sets
+that bind *how* any task is done.
 
 The result: capability that compounds on your disk rather than inside someone else's
 product, and travels with you to whatever model or harness comes next.
@@ -45,6 +47,7 @@ That copies:
 | From | To |
 | ---- | -- |
 | `workflows/` | `~/.agents/workflows/` |
+| `guidelines/` | `~/.agents/guidelines/` |
 | `AGENTS.md` | `~/.pi/agent/AGENTS.md`, `~/.codex/AGENTS.md`, `~/.opencode/AGENTS.md`, `~/.claude/CLAUDE.md` |
 | `.env.example` | `~/.agents/.env` (only if absent, `chmod 600`) |
 | `.config.example` | `~/.agents/.config` (only if absent) |
@@ -84,31 +87,62 @@ what keeps the context cost flat as the library grows. [`AGENTS.md`](AGENTS.md) 
 agent-facing instruction file that wires this up; copy it into your harness's own
 instruction file (`AGENTS.md`, `CLAUDE.md`, or whatever yours reads) and adjust.
 
+## Guidelines
+
+A **workflow** is a task: ordered steps and an end state. A **guideline** is a rule
+set: it binds *how* work is done while some other task runs. Several can apply at once,
+and whoever is acting — main session or subagent — applies them inline. A guideline is
+never delegated and never spawns a subagent of its own.
+
+A guideline is one Markdown file at `~/.agents/guidelines/<folder>/<name>.md` (or a
+project's `.agents/guidelines/`, which shadows the global folder of the same name). Its
+frontmatter has a single key, `applies_when`, followed by a `## Rules` bullet list and
+an optional `## Verify` block. Discovery mirrors the workflow scheme:
+
+```bash
+PY=$HOME/.agents/.venv/bin/python
+$PY $HOME/.agents/guidelines/list_guidelines.py          # resolved table, global + project-local
+$PY $HOME/.agents/guidelines/list_guidelines.py --sync   # rewrite the routing block in ~/.pi/agent/AGENTS.md
+$PY $HOME/.agents/guidelines/list_guidelines.py --check  # exit 1 if that block is stale
+```
+
+`--sync` rewrites the block between `<!-- BEGIN GENERATED -->` and
+`<!-- END GENERATED -->` in `AGENTS.md` with the table of global guidelines, so every
+session sees the routing filter at zero lookup cost. The shipped `AGENTS.md` already
+carries the block for the guidelines shipped here; it is owned by `--sync` and never
+hand-edited. `check_guideline.py` validates a guideline file against the standard the
+same way `work-with-workflow/check_workflow.py` validates a workflow; CI runs both.
+`work-with-guideline` is the workflow for creating, editing, renaming, or deleting a
+guideline.
+
 ## What's here
 
 ### Engineering workflows
 
 | Workflow | Use it when |
 | --- | --- |
-| `implement` | A concrete engineering task: feature, plan step, refactor, test repair. |
-| `bug-fix` | Something is broken — diagnose, fix, prove. |
-| `investigate` | Read-only recon of an unfamiliar area, before planning. |
-| `planning` | Decompose a task before any work starts. |
-| `review` | Judge delivered changes; read-only verdict. |
-| `write` | A non-code deliverable: spec, story, docs, report. |
-| `pull-request` | Push a branch for review, through merge and cleanup. |
-| `git` | Worktree-per-branch discipline and worktree hygiene. |
 | `dead-code-cleanup` | Find and prune unused production code, exports, deps. |
 | `dead-test-cleanup` | Find and prune orphan or vacuous tests. |
 | `specs-optimization` | Analyze how a repo's specs are split for agent consumption. |
 | `work-with-workflow` | Create, edit, or delete a workflow in this format. |
+| `work-with-guideline` | Create, edit, rename, or delete a guideline in the standard format. |
+
+There is deliberately no `implement`, `planning`, `review`, or `bug-fix` workflow.
+Generic reasoning work carries no information the model lacks, so it is done directly
+under `AGENTS.md`; workflows exist for project-, tool-, or domain-specific procedure.
 
 ### Agent runtime
 
 | Workflow | Use it when |
 | --- | --- |
 | `casper` | Run an approved complex goal as resumable, claim-safe fan-out execution. |
-| `heartbeat` | Schedule recurring agent tasks via a systemd user daemon (Linux). |
+
+### Guidelines
+
+| Guideline | Applies when |
+| --- | --- |
+| `git` | Mutating or remote git/gh work. Ships `merge-when-green.sh`: wait for every PR check, merge only if all are green, never bypass. |
+| `playwright` | Any Playwright session: headed vs headless, and loading/saving the `.auth/` profile. |
 
 ### Browser automation
 
@@ -172,17 +206,11 @@ These are per-workflow, not global — read the workflow file before running it.
 - **Node + `npx`** for `dead-code-cleanup` (uses `knip`).
 - **Node + `npm`** for `kernel-browser` and TypeScript helpers:
   `npm install --prefix ~/.agents tsx @onkernel/sdk`.
-- **`gh` CLI** for `pull-request`.
 - **Playwright browsers** for `playwright`:
   `PLAYWRIGHT_BROWSERS_PATH=workflows/playwright/.browsers python -m playwright install chromium`.
   Browser binaries are never committed — see `THIRD-PARTY-NOTICES.md` for why.
-- **Linux + `systemd --user`** for `heartbeat`. Copy
-  `heartbeat/tasks.yaml.example` to `tasks.yaml` (gitignored) and edit it.
 - **A kernel.sh account** and `KERNEL_API_KEY` for `kernel-browser`.
-
-Some workflows reference repo-specific scripts (`scripts/setup-worktree.sh`,
-`npx lefthook run pre-push`, and similar) as examples of a class of thing. Substitute
-your own repo's equivalent; they are not shipped here.
+- **`gh` CLI** for the `git` guideline's `merge-when-green.sh`.
 
 ## ⚠️ Terms-of-Service notice
 
