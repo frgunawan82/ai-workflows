@@ -4,83 +4,77 @@ trigger: "Run casper on this", "execute this goal", "continue the handover" — 
 
 ## Trigger
 
-"Run casper on this", "execute this goal", "continue the handover" — any approved complex goal needing resumable, claim-safe execution; also any existing handover under `~/.agents/handovers/<slug>/`.
+"Run casper on this", "execute this goal", "continue the handover", or an existing casper run under `~/.agents/state/casper/<slug>/`.
 
 ## Goal
 
-The approved `$HD/goal.md` is completed — by default one whole-goal plan and one executor call — every acceptance criterion passes verification, the result is reported, and the transient handover directory is cleaned up.
+The approved `$HD/goal.md` is completed, every acceptance criterion passes verification, the result is reported, and the transient `$HD` is cleaned up.
 
 ## Context
 
-**Pipeline and files.** `casper_fanout.py` claims open plans and makes one `LLM_harness.sh` executor call per plan; `casper_verify.py` decides the acceptance criteria; `casper_cleanup.py` retires the handover directory; `casper_status.py` maintains the `plans.json` status/lease ledger (plan frontmatter is a mirrored status). `casper_guard.py` (Claude token guard) and `casper_pi_guard.py` (Pi rpc guard) wrap dispatches; aliases, routing, credentials, effort defaults, guard mechanics: [`models-and-guards.md`](models-and-guards.md). Executor and verifier calls default to `medium` effort (GPT 5.6 Sol: `high`); plan authoring stays in the driving session at `xhigh`.
+**Pipeline.** `casper_fanout.py` claims open plans, one `LLM_harness.sh` executor call each; `casper_verify.py` decides acceptance criteria; `casper_cleanup.py` retires `$HD`; `casper_status.py` owns the `plans.json` status/lease ledger (plan frontmatter mirrors it). `casper_guard.py` (Claude token guard) and `casper_pi_guard.py` (Pi rpc guard) wrap dispatches; details, warm resume, zero-progress stops: [`models-and-guards.md`](models-and-guards.md). LLM needed because open-ended engineering work and subjective acceptance criteria cannot be enumerated in code.
 
-**Setup defaults.**
+**Setup.**
 
 ```bash
 PY="$HOME/.agents/.venv/bin/python"
 WF="$HOME/.agents/workflows/casper"
 SLUG="<kebab-case-goal>"
-HD="$HOME/.agents/handovers/$SLUG"
+HD="$HOME/.agents/state/casper/$SLUG"
 mkdir -p "$HD/logs"
-
-MODEL="" # auto
-STOPWATCH=7200
-MAXCTX=470000
 ```
 
-**Goal contract.** `$HD/goal.md` is the execution contract; shape and pairing rules: [`templates.md`](templates.md).
+**Contracts.** `$HD/goal.md` is the execution contract; its shape and pairing rules, plan shapes, checklist and split/wave rules: [`templates.md`](templates.md).
 
 **Plan ledger.**
 
 ```bash
-"$PY" "$WF/casper_status.py" --scaffold --handover-dir "$HD"  # whole-goal plan-01-$SLUG.md + plans.json, ledger seeded; exit 1 = no goal.md
+"$PY" "$WF/casper_status.py" --scaffold --handover-dir "$HD"  # plan-01-$SLUG.md + plans.json seeded; exit 1 = no goal.md
 ```
 
-Fill the scaffolded plan's `## Objective`; shapes, optional checklist, and split/wave rules: [`templates.md`](templates.md). For split plans (see Constraints) add plan files + `plans.json` entries yourself, then `--init`.
+Fill the scaffolded plan's `## Objective`. For split plans (see Constraints) write the plan files, list every plan (not only new ones; `plans.json` entry shape) in `$HD/manifest.json`, then `"$PY" "$WF/casper_status.py" --init --from-manifest "$HD/manifest.json" --handover-dir "$HD"` — the ledger becomes exactly that list; known plans keep their status.
 
-**Detached fanout + tracked watcher.** A fanout run outlives any single tool call: launch it detached, then immediately start a watcher the harness tracks so completion re-invokes the driver instead of stalling until the user asks:
+**Detached fanout + watcher.** A fanout run outlives any single tool call: launch it detached, then watch it so completion wakes the driver:
 
 ```bash
-BEFORE=$(stat -c %Y "$HD/fanout-result.json" 2>/dev/null || echo 0)
-setsid nohup "$PY" "$WF/casper_fanout.py" --handover-dir "$HD" \
-  --model "$MODEL" --stopwatch "$STOPWATCH" --max-context-tokens "$MAXCTX" \
-  >> "$HD/logs/fanout.log" 2>&1 & disown
+setsid nohup "$PY" "$WF/casper_fanout.py" --handover-dir "$HD" >> "$HD/logs/fanout.log" 2>&1 & disown
+sleep 1; pgrep -f "^[^ ]*python[^ ]* [^ ]*casper_fanout.py --handover-dir $HD"  # PID; the ^…python anchor excludes the calling shell
 ```
 
-Then, in a separate Bash call with `run_in_background: true` (its task-notification is the wake-up; if the driver crashes only the watcher dies — the **Resume checklist** recovers the still-running fanout):
+Empty output means fanout already exited (nothing open, or every open plan carries a `NEEDS-USER:`) — read `fanout-result.json`, no watcher. Otherwise, in a background shell call whose completion wakes the driver (a crash kills only the watcher; the resume checklist recovers it):
 
 ```bash
-while [ "$(stat -c %Y "$HD/fanout-result.json" 2>/dev/null || echo 0)" = "$BEFORE" ]; do sleep 30; done
-cat "$HD/fanout-result.json"
+while kill -0 <PID> 2>/dev/null; do sleep 30; done
+tail -n 3 "$HD/logs/fanout.log"; cat "$HD/fanout-result.json"
 ```
 
-Substitute `$BEFORE` with its literal value — shell state does not persist between calls. Fanout appends per-plan output to `logs/<plan>.log` and replaces `fanout-result.json` with the latest outcomes; re-runs are idempotent — done plans skipped, paused/failed retried, live claims never duplicated.
+Paste the PID literally — shell state does not persist between calls. Fanout appends per-plan output to `logs/<plan>.log` and atomically rewrites `fanout-result.json` with the latest outcomes (incl. `skipped_host_busy`); override `--model`/`--stopwatch`/`--max-context-tokens`/`--min-free-gb`/`--host-wait` as needed; re-runs are idempotent — done plans skipped, paused/failed retried, live claims never duplicated.
 
-**Completion semantics.** A resolver must explicitly mark its plan done through `casper_status.py`; exit `0` alone is not completion — without that signal the plan pauses. Timeout and token-budget exits (`124`/`137`) pause; other nonzero exits fail. An explicit done signal stays authoritative even if the process later times out or exits nonzero — except an open `NEEDS-USER:` always wins and pauses the plan. Warm resume and zero-progress stops: [`models-and-guards.md`](models-and-guards.md).
+**Completion semantics.** A resolver must explicitly mark its plan done via `casper_status.py`; exit `0` without that signal pauses it. Timeout and token-budget exits (`124`/`137`) pause; other nonzero exits fail. A done signal survives a later timeout or nonzero exit — but an open `NEEDS-USER:` always wins and pauses the plan.
 
-**Checkpoint and escalation.** The plan's `## Progress / Handover` section is a bounded replacement checkpoint, never an append-only journal — fanout embeds the exact replacement contract and wind-down obedience in every resolver prompt and compacts the section to 4000 characters (logs retain detail). An executor facing an irreversible/destructive or underivable decision records exactly one open **NEEDS-USER** line — `NEEDS-USER: <question and concrete options>` — finishes independent safe work, and stops. A `failed` plan's next attempt raises base effort by one (`medium`→`high`→`xhigh`→`max`; `max` stays); a pause never escalates effort.
+**Checkpoint and escalation.** `## Progress / Handover` is a bounded replacement checkpoint, never an append-only journal — fanout embeds that contract and wind-down obedience in every resolver prompt and compacts it to 4000 characters (logs retain detail). An executor facing an irreversible/destructive or underivable decision records exactly one open `NEEDS-USER: <question and options>` line, finishes independent safe work, and stops. A `failed` plan's next attempt runs one level above its configured/default effort (`medium`→`high`; `max` stays), not cumulative; a pause never escalates.
 
-**Lease safety.** Claims are atomic under a file lock; a claim lasts 7800 seconds (7200 stopwatch + 300 checkpoint grace + 300 slack), recorded in the lease; `--stale-secs` can lengthen protection but never shorten a recorded claim, even at `0` — wait for expiry. `casper_status.py --list-open` prints dispatchable work, not live-leased plans.
+**Lease safety.** Claims are atomic under a file lock and last stopwatch + grace + slack seconds (default 7800), recorded in the lease; `--stale-secs` lengthens but never shortens a recorded claim, even at `0` — wait for expiry. `--list-open` prints dispatchable work, not live-leased plans.
 
 **Verification semantics.**
 
 ```bash
-"$PY" "$WF/casper_verify.py" --handover-dir "$HD" --cwd "<project-root>" --model "$MODEL"
+"$PY" "$WF/casper_verify.py" --handover-dir "$HD" --cwd "<project-root>"
 ```
 
-The verifier refuses while any plan is unresolved (including live `in_progress`), decides each `command` method only from its declared timeout (default 300 seconds) and exit status, batches all `judgment` methods into one harness call — command-only verification makes no LLM call — and never fixes work. Every run atomically replaces `$HD/verify.json`, even on contract or execution failures, so stale passing evidence cannot authorize cleanup. On a failed criterion: map the evidence to the responsible plan, `"$PY" "$WF/casper_status.py" --set "plan-01-$SLUG.md" failed --handover-dir "$HD"`, replace its checkpoint with the exact repair and next action, reopen affected checklist items, rerun fanout, verify again.
+The verifier refuses while any plan is unresolved (incl. live `in_progress`), decides each `command` method only from its declared timeout (default 300 s) and exit status, batches all `judgment` methods into one harness call (none without them), and never fixes work. Every run atomically replaces `$HD/verify.json`, even on contract or execution failure — stale passing evidence never authorizes cleanup. On a failed criterion: map the evidence to its plan, `--set <plan> failed` it, replace its checkpoint with the exact repair and next action, reopen affected checklist items, rerun fanout, verify again.
 
 ## Constraints
 
-- **Goal approval gate**: show `goal.md` to the user and pause; do not plan or execute until the user approves it. The approved file is the contract — changes to its outcome or constraints require renewed approval.
-- Do not create specification documents, test scripts, or other artifacts unless the approved goal itself requires them.
-- One whole-goal plan and one executor call by default. Split only when a single executor cannot safely finish within the 7200-second / 470,000-token budget or when genuinely independent streams give useful concurrency; a plan whose inputs alone approach the token budget must be split.
+- **Goal approval gate**: show `goal.md` to the user and pause until approved; it is then the contract — changes to its outcome or constraints need renewed approval.
+- Do not create specification documents, test scripts, or other artifacts unless the approved goal requires them.
+- One whole-goal plan and one executor call by default. Split only when one executor cannot safely finish within the 7200-second / 470,000-token budget or when genuinely independent streams give useful concurrency; inputs alone near that budget force one.
 - Never edit `plans.json` by hand — `casper_status.py` is its only writer.
-- On wake, act without waiting for the user: surface any `NEEDS-USER:`, triage paused/failed plans, re-run fanout (fresh watcher) while open plans remain.
-- A `NEEDS-USER:` is answered by the user, never by you: ask, replace the line with the recorded answer (e.g. `ANSWERED:` plus `USER-ANSWER:`), update the next action, rerun fanout. Fanout keeps only the latest line and will not redispatch while it stands.
-- Verify only when every plan is done. Report unresolved criteria or `NEEDS-USER` blockers rather than claiming success.
-- Clean up only after the result is reported: `"$PY" "$WF/casper_cleanup.py" --handover-dir "$HD"` refuses unless the directory contains `goal.md`, the ledger has no unresolved plans, and `verify.json` is non-empty all-pass. `--force` is only for a goal the user has explicitly abandoned, and still enforces the shape check.
-- **Resume checklist**: re-read this file from disk first — the on-disk workflow wins over context; reuse the approved `$HD/goal.md`; inspect `plans.json`, checkpoints, `fanout-result.json`, log tails; resolve open `NEEDS-USER:` before dispatch; fanout detached + tracked watcher; verify when all done; clean up only on all-pass, else keep `$HD`.
+- A `NEEDS-USER:` is answered by the user, never by you: ask, replace the line with the answer under any other prefix (e.g. `USER-ANSWER: <answer>`), update the next action, rerun fanout; only the latest line counts and fanout never redispatches while one stands.
+- Report unresolved criteria or `NEEDS-USER` blockers rather than claiming success.
+- `$HD` is transient run state, not a deliverable: deferred-work notes belong in the target repo's `.agents/handovers/`, never here. Clean up in the same session the result is reported — the run is unfinished while `$HD` exists: `"$PY" "$WF/casper_cleanup.py" --handover-dir "$HD"` (refuses while anything is unresolved or unverified). `--force` is only for a goal the user explicitly abandoned and still enforces the shape check. Never rename `$HD` (`-archived`, `-superseded`, …) in place of deleting it: a rename retires nothing and only hides the dir. Reap leftovers with `casper_cleanup.py --sweep "$HOME/.agents/state/casper" --min-age-days 7` (`--dry-run` first).
+- **Host gate**: fanout launches a resolver only while `MemAvailable` >= `--min-free-gb` (default 4 GiB), waiting up to `--host-wait` seconds (default 900), otherwise recording `skipped_host_busy` and leaving the plan open for a later re-run. RAM here swings ~15 GB within an hour; `--min-free-gb 0` disables the gate, only for a host you measured yourself.
+- **On wake, act at once (resume checklist)**: re-read this file from disk (it wins over context); reuse the approved `$HD/goal.md`; a live fanout (launch-block `pgrep`) or `claimed_elsewhere` in `fanout-result.json` means another fanout holds the lease — watch that PID, never relaunch; inspect `plans.json`, checkpoints, `fanout-result.json`, log tails; surface and resolve any `NEEDS-USER:` before dispatch; triage paused/failed plans; re-run fanout (detached, fresh watcher) while some open plan has no `NEEDS-USER:` — when all carry one, fanout only re-pauses them: wait for the user; verify when all plans are done; clean up only on all-pass, else keep `$HD`.
 
 ## Verify
 
@@ -89,4 +83,4 @@ The verifier refuses while any plan is unresolved (including live `in_progress`)
 [ ! -d "$HD" ] && echo cleaned # after cleanup only
 ```
 
-Exit `0` = healthy: every plan done, no open `NEEDS-USER:`, `verify.json` non-empty all-pass. Exit `1` prints each failing check (or nothing-to-check when `$HD` is gone). If the script itself breaks, fall back to `--list-open` plus `cat` of `fanout-result.json` and `verify.json`.
+Exit `0` = healthy; exit `1` prints each failing check (nothing-to-check once `$HD` is gone).

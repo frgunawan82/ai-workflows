@@ -11,10 +11,14 @@ are NOT dispatched (they stay open in the ledger and are reported as
 `skipped_dependency` in fanout-result.json; a re-run picks them up once the earlier
 wave is done). Passing --wave N limits dispatch scope but still honors lower-wave gates.
 
+A plan is also left open and unclaimed (`skipped_host_busy`) when the host has less
+than --min-free-gb of MemAvailable and does not free up within --host-wait seconds.
+
 Exit codes:
   0  every plan in scope is done
-  1  one or more plans paused/failed/skipped (re-run to resume)
-  2  usage error
+  1  one or more plans paused/failed/skipped, incl. skipped_host_busy (re-run to resume)
+  2  usage error, including a selected plan whose backend/model/token-budget combination
+     cannot run — reported before anything is claimed or modified
 """
 
 from __future__ import annotations
@@ -96,6 +100,12 @@ _CLAUDE_ALIASES = {
     "haiku", "haiku-4.5", "haiku-4-5",
 }
 _GPT_56_SOL_MODELS = {"sol", "gpt-5-6-sol"}
+_BACKENDS = ("auto", "pi", "claude")
+# Historical claude token budget, applied only when --max-context-tokens is
+# OMITTED and the plan actually resolves to the claude backend. An omitted flag
+# on pi means "no cap" (pi has no token guard here), so the automatic pi route
+# keeps working; an explicit 0 disables the guard on either backend.
+DEFAULT_CLAUDE_CONTEXT_TOKENS = 470000
 
 
 def _default_model() -> str:
@@ -103,8 +113,9 @@ def _default_model() -> str:
 
     Under a pi driver (PI_CODING_AGENT with PI_PROVIDER and PI_MODEL set)
     resolvers inherit the driving session's own model as a provider-qualified
-    id — never the bare PI_MODEL, which for claude-* ids would silently route
-    to the Claude CLI. Anywhere else the historical Claude default stands.
+    id — never the bare PI_MODEL, so the driver's actual provider is kept (a
+    bare claude-* id would be re-qualified as anthropic/ by the harness).
+    Anywhere else the historical Claude default stands.
     Kept in lockstep with the harness by a parity test.
     """
     if (os.environ.get("PI_CODING_AGENT")
@@ -123,18 +134,148 @@ def _pi_session_exists(hd: Path, session_id: str) -> bool:
     return any((hd / "pi-sessions").glob(f"*_{session_id}.jsonl"))
 
 
+_PROVIDER_LIMIT_RE = re.compile(
+    r"usage limit|rate.?limit|too many requests|\b429\b|quota", re.IGNORECASE)
+
+
+def _pi_provider_limit(hd: Path, session_id: str) -> bool:
+    """True when the pi session's LAST assistant message died on a provider limit.
+
+    A resolver killed by a usage/rate limit (e.g. "Codex error: The usage limit
+    has been reached", HTTP 429) exits non-zero, which _status_for records as
+    failed — a cold restart that discards the intact session and escalates
+    effort. The limit is transient, so such a run must pause and warm-resume
+    instead. Only a TERMINAL limit error counts: any later successful assistant
+    message means pi recovered on its own and the exit had another cause.
+    """
+    files = sorted((hd / "pi-sessions").glob(f"*_{session_id}.jsonl"))
+    if not files:
+        return False
+    last_error = None
+    try:
+        with open(files[-1], encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                msg = entry.get("message")
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    continue
+                if msg.get("stopReason") == "error":
+                    last_error = str(msg.get("errorMessage") or "")
+                else:
+                    last_error = None  # recovered: a later message succeeded
+    except OSError:
+        return False
+    return bool(last_error and _PROVIDER_LIMIT_RE.search(last_error))
+
+
 def _model_key(model: str) -> str:
     """Normalize a harness alias or provider-qualified model id for matching."""
     unqualified = model.strip().lower().rsplit("/", 1)[-1]
     return re.sub(r"[^a-z0-9]+", "-", unqualified).strip("-")
 
 
-def _is_claude_model(model: str) -> bool:
-    """Mirror harness routing: only aliases and unqualified lowercase claude* use Claude."""
-    if "/" in model:
+def _is_claude_model(model: str, backend: str = "auto") -> bool:
+    """Mirror LLM_harness.sh: does this (model, backend) pair run on the Claude CLI?
+
+    `backend` is the selected axis, independent of the model:
+      claude - always the Claude CLI (the pair is validated by _claude_accepts);
+      pi     - always pi, whatever the model looks like;
+      auto   - the historical rule: only aliases and unqualified lowercase
+               claude* use Claude, and never under a pi driver (PI_CODING_AGENT
+               set), where the harness qualifies a bare claude-* id as
+               anthropic/<id> so it runs on pi with the driver's own credentials
+               ($PI_CODING_AGENT_DIR/auth.json, the pi-<profile> that launched
+               the driver) instead of the Claude CLI's separately logged-in
+               default profile.
+    Kept in lockstep with the harness (follow_driver/qualify_*) by a parity test.
+    """
+    if backend == "claude":
+        return True
+    if backend == "pi":
+        return False
+    if "/" in model or os.environ.get("PI_CODING_AGENT"):
         return False
     normalized = model.lower().replace(" ", "-")
     return normalized in _CLAUDE_ALIASES or model.startswith("claude")
+
+
+def _claude_accepts(model: str) -> bool:
+    """Mirror LLM_harness.sh qualify_claude(): can `--backend claude` run this model?
+
+    Accepts an unqualified lowercase claude* id (harness aliases included) and
+    anthropic/claude*, the one provider prefix naming the same models. Any other
+    provider-qualified id or non-Claude id is rejected so an explicit backend
+    never silently switches the user's model or provider.
+    """
+    m = model.strip()
+    if m.lower().replace(" ", "-") in _CLAUDE_ALIASES:
+        return True
+    if m.startswith("anthropic/"):
+        m = m[len("anthropic/"):]
+    return "/" not in m and m.startswith("claude")
+
+
+def _selected_backend(entry: dict, cli_backend: str) -> str:
+    """Backend precedence: non-empty per-plan `backend`, then --backend, then auto.
+
+    Independent of the model/effort precedence above it: a plan may pin its
+    backend without pinning a model, and vice versa.
+    """
+    return str(entry.get("backend") or cli_backend or "auto").strip()
+
+
+def _context_budget(max_context_tokens: int | None, claude_backend: bool) -> int:
+    """Token budget for one dispatch; 0 means the token guard is off.
+
+    An omitted --max-context-tokens keeps the historical 470000 default for the
+    claude backend only; on pi it means "no cap" (there is no pi token guard).
+    An explicit value is honored on claude and rejected up front on pi.
+    """
+    if not claude_backend:
+        return 0
+    if max_context_tokens is None:
+        return DEFAULT_CLAUDE_CONTEXT_TOKENS
+    return max_context_tokens
+
+
+def _validate_selection(entries: list[dict], cli_backend: str, cli_model: str | None,
+                        max_context_tokens: int | None) -> list[str]:
+    """Errors for every unresolved plan whose backend/model/budget cannot run.
+
+    Runs before any lease is taken and before any plan doc is rewritten, so a
+    mistyped backend or an unhonorable token cap never costs a claim, a status
+    change or a checkpoint edit. Only plans that would actually be dispatched
+    are checked, using the same precedence dispatch uses, and each message names
+    the offending plan file.
+    """
+    errors: list[str] = []
+    for e in entries:
+        name = e.get("file", "?")
+        backend = _selected_backend(e, cli_backend)
+        if backend not in _BACKENDS:
+            errors.append(f"{name}: backend must be one of {'|'.join(_BACKENDS)}, "
+                          f"got {backend!r} (per-plan 'backend' in plans.json)")
+            continue
+        model = e.get("model") or cli_model or _default_model()
+        explicit_model = bool(e.get("model") or cli_model)
+        if backend == "claude" and not _claude_accepts(model):
+            source = "" if explicit_model else " (the derived default model)"
+            errors.append(
+                f"{name}: backend 'claude' cannot run model {model!r}{source} — the "
+                "Claude CLI takes claude* or anthropic/claude* ids only. Set a Claude "
+                "model for this plan (--model, or the plan's 'model'), or drop the "
+                "claude backend to keep this model")
+            continue
+        if max_context_tokens and not _is_claude_model(model, backend):
+            errors.append(
+                f"{name}: --max-context-tokens {max_context_tokens} needs the claude "
+                f"backend, but this plan resolves to pi (backend {backend!r}, model "
+                f"{model!r}); pi has no token guard. Use backend 'claude' or "
+                "--max-context-tokens 0")
+    return errors
 
 
 def _effective_effort(configured: str | None, prior_status: str,
@@ -248,6 +389,47 @@ def _flag_over_budget(plan_path: Path, count: int, budget: int, max_chars: int) 
     _compact_checkpoint(plan_path, max_chars)  # bound it; ours is the latest NEEDS-USER
 
 
+def _mem_available_gb(meminfo_path: str = "/proc/meminfo") -> float | None:
+    """Free-for-allocation RAM in GiB, or None when the probe itself is unreadable."""
+    try:
+        with open(meminfo_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1048576  # kB -> GiB
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _wait_for_host(min_free_gb: float, max_wait: int, poll: int = 30,
+                   probe=_mem_available_gb, sleep=time.sleep,
+                   label: str = "") -> bool:
+    """True once the host has the RAM headroom to take another resolver.
+
+    A resolver is a full agent session; launching one onto a box that is already
+    out of memory gets it SIGKILLed mid-flight. Gate on MemAvailable only (load
+    average says nothing about the failure mode) and never block on a broken
+    probe: an unreadable /proc/meminfo passes the gate open. Elapsed time is
+    counted from the sleeps, so the bound holds regardless of wall clock.
+    """
+    if min_free_gb <= 0:
+        return True
+    free = probe()
+    if free is None or free >= min_free_gb:
+        return True
+    print(f"[fanout] host busy: MemAvailable {free:.1f} GiB < {min_free_gb} GiB — "
+          f"waiting up to {max_wait} s{' for ' + label if label else ''}",
+          file=sys.stderr)
+    elapsed = 0
+    while elapsed < max_wait:
+        sleep(poll)
+        elapsed += poll
+        free = probe()
+        if free is None or free >= min_free_gb:
+            return True
+    return False
+
+
 def _status_for(exit_code: int, already_done: bool, needs_user: bool = False) -> str:
     """Derive the ledger status from the resolver's exit code AND its own signal.
 
@@ -278,9 +460,11 @@ def main() -> int:
     ap.add_argument("--slack", type=int, default=300, help="Extra margin before a lease is stale (s)")
     ap.add_argument("--checkpoint-chars", type=int, default=4000,
                     help="Maximum Progress / Handover checkpoint size")
-    ap.add_argument("--max-context-tokens", type=int, default=470000,
-                    help="Hard per-resolver context-token budget for the claude backend; "
-                         "0 disables the token guard")
+    ap.add_argument("--max-context-tokens", type=int, default=None,
+                    help="Hard per-resolver context-token budget; claude backend only "
+                         f"(omitted: {DEFAULT_CLAUDE_CONTEXT_TOKENS} on claude, no cap on "
+                         "pi; 0 disables the token guard; a nonzero value on a plan that "
+                         "resolves to pi is an error)")
     ap.add_argument("--context-grace", type=int, default=40000,
                     help="Token margin before the hard limit at which the wind-down "
                          "notice is injected")
@@ -288,6 +472,14 @@ def main() -> int:
                     help="Override model for all plans (alias like sonnet/opus or full id; "
                          "resolved by LLM_harness.sh)")
     ap.add_argument("--effort", default=None, help="Override thinking/effort for all plans")
+    ap.add_argument("--backend", choices=_BACKENDS, default="auto",
+                    help="Backend for all plans (auto: the harness's model/driver rule); "
+                         "a non-empty per-plan 'backend' in plans.json wins over this")
+    ap.add_argument("--min-free-gb", type=float, default=4.0,
+                    help="Minimum MemAvailable before a resolver is launched; "
+                         "0 disables the host gate")
+    ap.add_argument("--host-wait", type=int, default=900,
+                    help="Seconds to wait for that headroom before skipping the plan")
     ap.add_argument("--wave", type=int, default=None, help="Limit to a single wave")
     ap.add_argument("--harness", type=Path, default=DEFAULT_HARNESS)
     args = ap.parse_args()
@@ -295,11 +487,14 @@ def main() -> int:
             or args.checkpoint_chars <= len(_NEEDS_USER_PREFIX)):
         ap.error("stopwatch must be positive; grace/slack must be non-negative; "
                  "checkpoint-chars must fit a NEEDS-USER marker")
-    if args.max_context_tokens < 0 or (
-            args.max_context_tokens
-            and not 0 <= args.context_grace < args.max_context_tokens):
+    budget_for_grace = (DEFAULT_CLAUDE_CONTEXT_TOKENS if args.max_context_tokens is None
+                        else args.max_context_tokens)
+    if (args.max_context_tokens is not None and args.max_context_tokens < 0) or (
+            budget_for_grace and not 0 <= args.context_grace < budget_for_grace):
         ap.error("max-context-tokens must be >= 0; context-grace must satisfy "
                  "0 <= context-grace < max-context-tokens")
+    if args.min_free_gb < 0 or args.host_wait < 0:
+        ap.error("min-free-gb and host-wait must be non-negative")
 
     hd: Path = args.handover_dir
     if not cs.ledger_path(hd).exists():
@@ -317,6 +512,16 @@ def main() -> int:
     if all(e.get("status", "pending") == "done" for e in selected):
         print("nothing open to dispatch; every plan in scope is done")
         return 0
+
+    # Validate the selected, still-unresolved (backend, model, budget) triples
+    # BEFORE any lease or plan mutation: an impossible pair must cost nothing.
+    errors = _validate_selection(
+        [e for e in selected if e.get("status", "pending") != "done"],
+        args.backend, args.model, args.max_context_tokens)
+    if errors:
+        for message in errors:
+            print(f"casper_fanout.py: {message}", file=sys.stderr)
+        return 2
 
     waves = sorted({int(e.get("wave", 0)) for e in selected})
     results: list[dict] = []
@@ -359,6 +564,17 @@ def main() -> int:
                                 "status": "paused", "needs_user": True,
                                 "effort": None, "log": None})
                 continue  # user answer must replace NEEDS-USER before any re-dispatch
+            # Gate on host RAM before claiming: a gated plan must stay open and
+            # unleased so a later run picks it up (a NEEDS-USER pause above must
+            # never wait for the host first).
+            if not _wait_for_host(args.min_free_gb, args.host_wait,
+                                  label=e["file"]):
+                results.append({"file": e["file"], "wave": wave, "exit_code": None,
+                                "status": "skipped_host_busy", "needs_user": False,
+                                "effort": None, "log": None})
+                print(f"insufficient free RAM for {e['file']} — leaving it open; "
+                      f"re-run fanout later", file=sys.stderr)
+                continue
             if cs.claim(hd, e["file"], stale_secs) != "claimed":
                 current = cs._find(cs._load_raw(hd), e["file"])
                 if current and current.get("status") != "done":
@@ -368,11 +584,15 @@ def main() -> int:
                 continue
             # Model precedence is per-plan, then CLI override, then the driver-
             # aware default (the pi driver's own model under pi, otherwise Opus).
-            # Claude gets token-budget prompts/state; each backend warm-resumes
-            # its own paused sessions.
+            # Backend precedence is the same shape but independent: per-plan,
+            # then --backend, then auto (the harness's model/driver rule).
+            # The effective backend alone decides token-budget prompts/state vs
+            # pi session flags, and each backend warm-resumes only its own
+            # paused sessions.
             model = e.get("model") or args.model or _default_model()
-            claude_backend = _is_claude_model(model)
-            context_budget = args.max_context_tokens if claude_backend else 0
+            backend = _selected_backend(e, args.backend)
+            claude_backend = _is_claude_model(model, backend)
+            context_budget = _context_budget(args.max_context_tokens, claude_backend)
             budget_note = ""
             if context_budget:
                 budget_note = BUDGET_NOTE.format(
@@ -381,16 +601,21 @@ def main() -> int:
             resume_id = None
             pi_session = None
             pi_resume = False
+            # A recorded session id belongs to the CLI that minted it: a claude
+            # id means nothing to pi and vice versa. Only a session tagged with
+            # the backend about to run is warm-resumable; an untagged legacy
+            # entry cold-starts once and is re-recorded with its tag.
+            tagged = (current.get("session_backend")
+                      if current.get("status") == "paused" else None)
             if claude_backend:
-                if context_budget and current.get("status") == "paused":
+                if context_budget and tagged == "claude":
                     resume_id = current.get("session")
             else:
                 # Pi warm resume: a pause re-enters the recorded per-plan session
                 # (the harness resolves it to a cwd-independent `--session <file>`)
                 # only while its session file exists; anything else — fresh plan,
-                # failed retry, stale/foreign id — cold-starts a new id.
-                recorded = (current.get("session")
-                            if current.get("status") == "paused" else None)
+                # failed retry, stale/foreign/untagged id — cold-starts a new id.
+                recorded = current.get("session") if tagged == "pi" else None
                 if recorded and _pi_session_exists(hd, recorded):
                     pi_session, pi_resume = recorded, True
                 else:
@@ -403,7 +628,7 @@ def main() -> int:
                 status_script=STATUS_SCRIPT, plan_file=e["file"], handover_dir=hd)
             state_path = hd / "logs" / f"{Path(e['file']).stem}.state.json"
             state_path.unlink(missing_ok=True)  # never re-read a previous round's state
-            cmd = [str(args.harness), "-m", model]
+            cmd = [str(args.harness), "-m", model, "--backend", backend]
             effort = _effective_effort(e.get("effort") or args.effort,
                                        e.get("status", "pending"), model)
             cmd += ["-t", effort]
@@ -423,7 +648,9 @@ def main() -> int:
             log_path = hd / "logs" / f"{Path(e['file']).stem}.log"
             fh = open(log_path, "a")  # append: keep earlier rounds' output for debugging
             fh.write(f"# {e['file']} | wave {wave} | stopwatch {args.stopwatch}s | "
-                     f"ctx {context_budget} | "
+                     f"backend {backend}"
+                     f"{'' if backend != 'auto' else ' -> ' + ('claude' if claude_backend else 'pi')}"
+                     f" | model {model} | ctx {context_budget} | "
                      f"resume {resume_id or '-'} | "
                      f"started {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
             fh.flush()
@@ -443,6 +670,16 @@ def main() -> int:
             already_done = bool(current) and current.get("status") == "done"
             status = _status_for(code, already_done, needs_user)
             session, pause_reason, zero_progress = None, None, 0
+            if (status == "failed" and pi_session
+                    and _pi_provider_limit(hd, pi_session)):
+                # A transient provider usage/rate limit ended the run mid-flight.
+                # "failed" would cold-restart (discarding the intact session) and
+                # escalate effort; pause instead so the next round warm-resumes.
+                status = "paused"
+                pause_reason = "provider-limit"
+                with open(log_path, "a") as lf:
+                    lf.write("[fanout] provider usage/rate limit ended the run; "
+                             "recording pause (warm resume) instead of failure\n")
             if status == "paused" and claude_backend:
                 state = _read_state(state_path)
                 session, pause_reason = _warm_session(
@@ -456,8 +693,12 @@ def main() -> int:
             elif (status == "paused" and pi_session
                     and _pi_session_exists(hd, pi_session)):
                 session = pi_session  # next dispatch re-enters this pi session
+            # Tag the id with the CLI that minted it, so the next dispatch only
+            # resumes it on that same backend (and clears the tag with the id).
+            session_backend = ("claude" if claude_backend else "pi") if session else None
             cs.set_status(hd, e["file"], status, session=session,
-                          pause_reason=pause_reason, zero_progress=zero_progress)
+                          pause_reason=pause_reason, zero_progress=zero_progress,
+                          session_backend=session_backend)
             results.append({"file": e["file"], "wave": wave, "exit_code": code,
                             "status": status, "needs_user": needs_user,
                             "effort": effort, "resumed": resumed,
@@ -479,7 +720,10 @@ def main() -> int:
             break
 
     if results:
-        (hd / "fanout-result.json").write_text(json.dumps(results, indent=2) + "\n")
+        out = hd / "fanout-result.json"
+        tmp = out.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(results, indent=2) + "\n")
+        os.replace(tmp, out)  # atomic within the same directory
     done = sum(r["status"] == "done" for r in results)
     skipped = sum(r["status"] == "skipped_dependency" for r in results)
     summary = f"dispatched {len(results) - skipped} plan(s): {done} done, " \

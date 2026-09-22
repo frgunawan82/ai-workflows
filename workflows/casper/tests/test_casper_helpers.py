@@ -5,7 +5,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 WF = Path(__file__).resolve().parents[1]
@@ -13,6 +15,7 @@ sys.path.insert(0, str(WF))
 
 import casper_fanout as fanout
 import casper_guard as guard
+import casper_pi_guard as pi_guard
 import casper_status as status
 import casper_verify as verify
 
@@ -142,8 +145,133 @@ class FanoutTests(unittest.TestCase):
             self.assertEqual(body.count("NEEDS-USER: "), 1)
             self.assertIn("NEEDS-USER: latest", body)
 
+    def test_mem_available_is_parsed_and_missing_probe_is_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            meminfo = Path(tmp) / "meminfo"
+            meminfo.write_text(
+                "MemTotal:       65679416 kB\n"
+                "MemFree:         1048576 kB\n"
+                "MemAvailable:    2097152 kB\n"
+                "Buffers:          123456 kB\n"
+            )
+            self.assertAlmostEqual(fanout._mem_available_gb(str(meminfo)), 2.0)
+            self.assertIsNone(fanout._mem_available_gb(str(Path(tmp) / "nope")))
+            (Path(tmp) / "empty").write_text("MemTotal: 1 kB\n")
+            self.assertIsNone(fanout._mem_available_gb(str(Path(tmp) / "empty")))
+
+    def test_wait_for_host_is_bounded_and_skips_probe_when_disabled(self) -> None:
+        sleeps: list[int] = []
+
+        def sleeper(seconds: int) -> None:
+            sleeps.append(seconds)
+
+        # Green on the first probe: no waiting at all.
+        self.assertTrue(fanout._wait_for_host(
+            4.0, 900, poll=30, probe=lambda: 8.0, sleep=sleeper))
+        self.assertEqual(sleeps, [])
+
+        # Red then green: exactly one poll interval slept.
+        readings = iter([1.0, 9.0])
+        self.assertTrue(fanout._wait_for_host(
+            4.0, 900, poll=30, probe=lambda: next(readings), sleep=sleeper))
+        self.assertEqual(sleeps, [30])
+
+        # Red for the whole window: bounded by max_wait / poll, then False.
+        sleeps.clear()
+        self.assertFalse(fanout._wait_for_host(
+            4.0, 90, poll=30, probe=lambda: 0.5, sleep=sleeper))
+        self.assertEqual(len(sleeps), 3)  # ceil(90 / 30)
+
+        # An unreadable probe never blocks dispatch.
+        sleeps.clear()
+        self.assertTrue(fanout._wait_for_host(
+            4.0, 90, poll=30, probe=lambda: None, sleep=sleeper))
+        self.assertEqual(sleeps, [])
+
+        # The gate is off at 0: the probe is never even called.
+        def must_not_probe() -> float:
+            raise AssertionError("probed while the host gate is disabled")
+
+        self.assertTrue(fanout._wait_for_host(
+            0, 900, poll=30, probe=must_not_probe, sleep=sleeper))
+        self.assertEqual(sleeps, [])
+
+    def test_host_gate_skips_plan_without_claiming_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hd = root / "handover"
+            hd.mkdir()
+            (hd / "goal.md").write_text("## Goal\nDo it\n")
+            (hd / "plan.md").write_text(
+                "---\nstatus: pending\n---\n## Objective\nDo it\n\n## Progress / Handover\n"
+            )
+            (hd / "plans.json").write_text('[{"file":"plan.md","title":"one","wave":0}]')
+            status.init(hd)
+            marker = root / "called"
+            harness = root / "must_not_run"
+            harness.write_text(f"#!/bin/sh\ntouch {marker}\n")
+            harness.chmod(0o755)
+            # An unreachable threshold makes the real probe red; --host-wait 0
+            # returns immediately, so the gate is deterministic and instant.
+            run = subprocess.run(
+                [PYTHON, str(WF / "casper_fanout.py"), "--handover-dir", str(hd),
+                 "--harness", str(harness), "--stopwatch", "5",
+                 "--min-free-gb", "999999", "--host-wait", "0"],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+            )
+            self.assertEqual(run.returncode, 1, run.stdout)
+            self.assertFalse(marker.exists())  # never dispatched
+            results = json.loads((hd / "fanout-result.json").read_text())
+            self.assertEqual([row["status"] for row in results], ["skipped_host_busy"])
+            entry = status._find(status._load_raw(hd), "plan.md")
+            self.assertEqual(entry["status"], "pending")  # never claimed
+            self.assertIsNone(entry.get("lease"))
+            self.assertEqual(status.list_open(hd, 900), ["plan.md"])  # still dispatchable
+
     def test_needs_user_wins_over_resolver_done_signal(self) -> None:
         self.assertEqual(fanout._status_for(0, already_done=True, needs_user=True), "paused")
+
+    def test_pi_provider_limit_detects_terminal_limit_errors_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hd = Path(tmp)
+            (hd / "pi-sessions").mkdir()
+            sid = "abc123"
+            f = hd / "pi-sessions" / f"2026-01-01T00-00-00-000Z_{sid}.jsonl"
+
+            def entry(role: str, stop: str | None = None,
+                      err: str | None = None) -> str:
+                msg: dict = {"role": role}
+                if stop:
+                    msg["stopReason"] = stop
+                if err:
+                    msg["errorMessage"] = err
+                return json.dumps({"type": "message", "message": msg})
+
+            # Terminal usage-limit / 429 errors -> True.
+            f.write_text("\n".join([
+                entry("assistant", "toolUse"),
+                entry("toolResult"),
+                entry("assistant", "error",
+                      "Codex error: The usage limit has been reached"),
+            ]) + "\n")
+            self.assertTrue(fanout._pi_provider_limit(hd, sid))
+            f.write_text(entry(
+                "assistant", "error",
+                '429 {"type":"error","error":{"type":"rate_limit_error"}}') + "\n")
+            self.assertTrue(fanout._pi_provider_limit(hd, sid))
+
+            # A recovered session (later successful assistant message) -> False.
+            f.write_text("\n".join([
+                entry("assistant", "error",
+                      "Codex error: The usage limit has been reached"),
+                entry("assistant", "stop"),
+            ]) + "\n")
+            self.assertFalse(fanout._pi_provider_limit(hd, sid))
+
+            # Unrelated terminal error, missing session file -> False.
+            f.write_text(entry("assistant", "error", "boom") + "\n")
+            self.assertFalse(fanout._pi_provider_limit(hd, sid))
+            self.assertFalse(fanout._pi_provider_limit(hd, "missing"))
 
     def test_model_aware_effort_defaults_cover_supported_forms(self) -> None:
         cases = {
@@ -312,9 +440,12 @@ class FanoutTests(unittest.TestCase):
             (hd / "plan.md").write_text(
                 "---\nstatus: paused\n---\n## Objective\nDo it\n\n## Progress / Handover\n"
             )
+            # session_backend tags the id with the CLI that minted it; only a
+            # matching backend warm-resumes it (an untagged legacy id restarts).
             (hd / "plans.json").write_text(json.dumps([{
                 "file": "plan.md", "title": "one", "wave": 0, "status": "paused",
-                "session": "sess-warm-1", "pause_reason": "child-exit"}]))
+                "session": "sess-warm-1", "session_backend": "claude",
+                "pause_reason": "child-exit"}]))
             status.init(hd)
             argv_dump = root / "argv.json"
             harness = root / "fake_harness.py"
@@ -421,6 +552,73 @@ class FanoutTests(unittest.TestCase):
             self.assertIn("Resolve the whole approved work unit", argv[-1])
             self.assertEqual(argv[argv.index("-t") + 1], "high")  # failed -> +1
             self.assertEqual(ledger_entry()["session"], fresh)  # new pause re-records
+
+    def test_pi_provider_limit_failure_pauses_for_warm_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hd = root / "handover"
+            hd.mkdir()
+            (hd / "goal.md").write_text("## Goal\nDo it\n")
+            (hd / "plan.md").write_text(
+                "---\nstatus: pending\n---\n## Objective\nDo it\n\n## Progress / Handover\n"
+            )
+            (hd / "plans.json").write_text(json.dumps([
+                {"file": "plan.md", "title": "one", "wave": 0,
+                 "model": "prov/model-x"}]))
+            status.init(hd)
+            argv_dir = root / "argv"
+            argv_dir.mkdir()
+            harness = root / "fake_harness.py"
+            # Exits 1 after writing a session whose LAST assistant message is a
+            # provider usage-limit error — the failure mode of a Codex limit.
+            harness.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json,pathlib,sys,time\n"
+                f"d=pathlib.Path({str(argv_dir)!r})\n"
+                "d.joinpath(f'{time.monotonic_ns()}.json').write_text(json.dumps(sys.argv))\n"
+                "sid=sys.argv[sys.argv.index('--pi-session-id')+1]\n"
+                "sd=pathlib.Path(sys.argv[sys.argv.index('--pi-session-dir')+1])\n"
+                "sd.mkdir(exist_ok=True)\n"
+                "line=json.dumps({'type':'message','message':{'role':'assistant',"
+                "'stopReason':'error',"
+                "'errorMessage':'Codex error: The usage limit has been reached'}})\n"
+                "(sd/f'2026-01-01T00-00-00-000Z_{sid}.jsonl').write_text(line+'\\n')\n"
+                "sys.exit(1)\n"
+            )
+            harness.chmod(0o755)
+
+            def run_fanout() -> list[str]:
+                run = subprocess.run(
+                    [PYTHON, str(WF / "casper_fanout.py"), "--handover-dir", str(hd),
+                     "--harness", str(harness), "--stopwatch", "5",
+                     "--grace", "1", "--slack", "1"],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    check=False)
+                self.assertEqual(run.returncode, 1, run.stdout)  # never done
+                return json.loads(sorted(argv_dir.iterdir())[-1].read_text())
+
+            def ledger_entry() -> dict:
+                return json.loads((hd / "plans.json").read_text())[0]
+
+            # Round 1: exit 1 + terminal limit error -> paused (not failed),
+            # session recorded for warm resume, reason recorded in the ledger.
+            argv = run_fanout()
+            sid = argv[argv.index("--pi-session-id") + 1]
+            entry = ledger_entry()
+            self.assertEqual(entry["status"], "paused")
+            self.assertEqual(entry["session"], sid)
+            self.assertEqual(entry["pause_reason"], "provider-limit")
+            result = json.loads((hd / "fanout-result.json").read_text())[0]
+            self.assertEqual(result["status"], "paused")
+            log = (hd / "logs" / "plan.log").read_text()
+            self.assertIn("provider usage/rate limit", log)
+
+            # Round 2: warm resume of the SAME session, effort NOT escalated
+            # (a limit pause must never behave like a failure).
+            argv = run_fanout()
+            self.assertEqual(argv[argv.index("--pi-session-id") + 1], sid)
+            self.assertIn("RESUMING", argv[-1])
+            self.assertEqual(argv[argv.index("-t") + 1], "medium")
 
     def test_pi_retries_cold_with_full_prompt_despite_stale_claude_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -918,6 +1116,8 @@ class HarnessTests(unittest.TestCase):
                 self.assertIn(f"{flag} low", run.stdout)
 
     def test_harness_and_fanout_model_routing_stay_in_parity(self) -> None:
+        # The token cap is claude-only: it is passed on the claude cases and an
+        # explicit cap on a pi case is asserted to fail loudly further down.
         cases = (
             # model, Claude backend, resolved model, Pi provider args
             ("opus", True, "claude-opus-5", None),
@@ -935,12 +1135,24 @@ class HarnessTests(unittest.TestCase):
                 self.assertEqual(fanout._is_claude_model(model), is_claude)
                 run = subprocess.run(
                     [str(WF / "LLM_harness.sh"), "--dry-run", "--model", model,
-                     "--thinking", "max", "--max-context-tokens", "470000",
+                     "--thinking", "max",
+                     "--max-context-tokens", "470000" if is_claude else "0",
                      "--", "hi"],
                     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     env={**os.environ, "PI_OFFLINE": "1"}, check=False,
                 )
                 self.assertEqual(run.returncode, 0, run.stdout)
+                if not is_claude:
+                    # an explicit cap the pi route cannot honor is a usage error,
+                    # never a silently dropped budget
+                    capped = subprocess.run(
+                        [str(WF / "LLM_harness.sh"), "--dry-run", "--model", model,
+                         "--max-context-tokens", "470000", "--", "hi"],
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        env={**os.environ, "PI_OFFLINE": "1"}, check=False,
+                    )
+                    self.assertEqual(capped.returncode, 2, capped.stdout)
+                    self.assertIn("needs the claude backend", capped.stdout)
                 if is_claude:
                     self.assertIn("casper_guard.py", run.stdout)
                     self.assertIn(f"--model {resolved}", run.stdout)
@@ -1092,14 +1304,16 @@ class HarnessTests(unittest.TestCase):
         self.assertIn("pi --mode rpc", run.stdout)
         self.assertIn("--model anthropic/claude-opus-5", run.stdout)
         self.assertIn("--thinking medium", run.stdout)
-        # an explicit --model always beats the driver default
+        # an explicit --model always beats the driver default — but a bare
+        # claude-* id still follows the driver's credentials (pi route)
         run = subprocess.run(
             [str(WF / "LLM_harness.sh"), "--dry-run", "--model", "sonnet", "--", "hi"],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env=pi_env, check=False)
         self.assertEqual(run.returncode, 0, run.stdout)
-        self.assertIn("claude -p", run.stdout)
-        self.assertIn("--model claude-sonnet-5", run.stdout)
+        self.assertIn("pi --mode rpc", run.stdout)
+        self.assertNotIn("claude -p", run.stdout)
+        self.assertIn("--model anthropic/claude-sonnet-5", run.stdout)
         # --model "" is the documented auto knob (casper.md MODEL="")
         run = subprocess.run(
             [str(WF / "LLM_harness.sh"), "--dry-run", "--model", "", "--", "hi"],
@@ -1107,6 +1321,64 @@ class HarnessTests(unittest.TestCase):
             env=pi_env, check=False)
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertIn("--model anthropic/claude-opus-5", run.stdout)
+
+    def test_bare_claude_follows_the_pi_driver_credentials(self) -> None:
+        # Under a pi driver a bare claude-* id (alias or full id) must run on pi
+        # as anthropic/<id>: pi reads $PI_CODING_AGENT_DIR/auth.json, i.e. the
+        # pi-<profile> that launched the driver, whereas the Claude CLI reads
+        # $CLAUDE_CONFIG_DIR (default ~/.claude), which no pi profile sets.
+        # PI_CODING_AGENT alone is the driver signal; PI_PROVIDER/PI_MODEL only
+        # matter for composing the no-model default. Non-Claude ids are untouched.
+        cases = (
+            # model, Claude backend, harness --model, Pi provider args
+            ("opus", False, "anthropic/claude-opus-5", None),
+            ("Fable 5", False, "anthropic/claude-fable-5", None),
+            ("claude-opus-5", False, "anthropic/claude-opus-5", None),
+            ("anthropic/claude-sonnet-5", False, "anthropic/claude-sonnet-5", None),
+            ("gpt-5.6-sol", False, "gpt-5.6-sol", "openai"),
+            ("openai-codex/gpt-5.6-sol", False, "openai-codex/gpt-5.6-sol", None),
+        )
+        for extra in (PI_DRIVER_ENV, {"PI_CODING_AGENT": "true"}):
+            for model, is_claude, resolved, pi_provider in cases:
+                with self.subTest(pi_env=sorted(extra), model=model):
+                    with unittest.mock.patch.dict(os.environ, extra):
+                        self.assertEqual(fanout._is_claude_model(model), is_claude)
+                    run = subprocess.run(
+                        [str(WF / "LLM_harness.sh"), "--dry-run", "--model", model,
+                         "--max-context-tokens", "0", "--", "hi"],
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        env={**os.environ, **extra, "PI_OFFLINE": "1"}, check=False,
+                    )
+                    self.assertEqual(run.returncode, 0, run.stdout)
+                    self.assertIn("pi --mode rpc", run.stdout)
+                    self.assertNotIn("claude -p", run.stdout)
+                    self.assertNotIn("casper_guard.py", run.stdout)
+                    self.assertIn(f"--model {resolved}", run.stdout)
+                    if pi_provider:
+                        self.assertIn(f"--provider {pi_provider}", run.stdout)
+                    else:
+                        self.assertNotIn("--provider", run.stdout)
+                    # the driver route has no token guard, so an explicit cap on
+                    # it is refused instead of silently dropped
+                    capped = subprocess.run(
+                        [str(WF / "LLM_harness.sh"), "--dry-run", "--model", model,
+                         "--max-context-tokens", "470000", "--", "hi"],
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        env={**os.environ, **extra, "PI_OFFLINE": "1"}, check=False,
+                    )
+                    self.assertEqual(capped.returncode, 2, capped.stdout)
+                    self.assertIn("needs the claude backend", capped.stdout)
+        # Outside pi the Claude CLI route is unchanged (env stripped at import).
+        self.assertTrue(fanout._is_claude_model("claude-opus-5"))
+        run = subprocess.run(
+            [str(WF / "LLM_harness.sh"), "--dry-run", "--model", "claude-opus-5",
+             "--", "hi"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env={**os.environ, "PI_OFFLINE": "1"}, check=False,
+        )
+        self.assertEqual(run.returncode, 0, run.stdout)
+        self.assertIn("claude -p", run.stdout)
+        self.assertIn("--model claude-opus-5", run.stdout)
 
     def test_fanout_default_model_stays_in_parity_with_harness(self) -> None:
         probe = ("import sys; sys.path.insert(0, '.'); "
@@ -1217,6 +1489,43 @@ class PiGuardTests(unittest.TestCase):
     """casper_pi_guard.py behavior with real child processes (no pi involved)."""
 
     GUARD = WF / "casper_pi_guard.py"
+
+    def test_dedicated_watch_dir_ignores_same_named_foreign_sessions(self) -> None:
+        """A watch dir is this run's only activity signal.
+
+        The needle is basename(cwd), so the shared trees also match unrelated
+        sessions in a worktree of the same name. Unioning them reset the stall
+        timer on every foreign write and blinded the watchdog.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            needle = "my-worktree"
+            # Foreign-but-same-basename sessions: the driving session and one of
+            # its subagents. Both are NEWER than this resolver's own session.
+            for sub in ("sessions", "subagent-sessions"):
+                foreign = root / "agent" / sub / f"--home-user-worktrees-{needle}--"
+                foreign.mkdir(parents=True)
+                busy = foreign / "foreign.jsonl"
+                busy.write_text("{}\n")
+                os.utime(busy, (5000.0, 5000.0))
+
+            watch = root / "handover" / "pi-sessions"
+            watch.mkdir(parents=True)
+            mine = watch / "resolver.jsonl"
+            mine.write_text("{}\n")
+            os.utime(mine, (1000.0, 1000.0))  # stalled long before the foreign writes
+
+            session_root = root / "agent"
+            self.assertEqual(
+                pi_guard.newest_session_mtime(session_root, needle, (watch,)),
+                1000.0,
+                "foreign same-basename sessions must not count as activity",
+            )
+            # Without a dedicated dir, the shared trees remain the fallback.
+            self.assertEqual(
+                pi_guard.newest_session_mtime(session_root, needle, ()),
+                5000.0,
+            )
 
     def _run(self, guard_args: list[str], child: list[str],
              timeout: int = 60) -> subprocess.CompletedProcess:
@@ -1640,6 +1949,141 @@ class CleanupTests(unittest.TestCase):
             )
             self.assertEqual(run.returncode, 1, run.stdout)
             self.assertTrue(hd.exists())
+
+
+class CleanupSweepTests(unittest.TestCase):
+    """--sweep ROOT: bulk reap of leftover run dirs (renamed ones included)."""
+
+    def _run_dir(self, root: Path, name: str, *, plan_status: str = "done",
+                 verify: str | None = '[{"criterion":"x","status":"pass","evidence":"ok"}]',
+                 goal: bool = True, claim: bool = False) -> Path:
+        hd = root / name
+        hd.mkdir(parents=True)
+        if goal:
+            (hd / "goal.md").write_text("## Goal\nDo it\n")
+        (hd / "plan.md").write_text("---\nstatus: pending\n---\n")
+        (hd / "plans.json").write_text('[{"file":"plan.md","title":"one","wave":0}]')
+        status.init(hd)
+        if claim:
+            self.assertEqual(status.claim(hd, "plan.md", 900), "claimed")
+        else:
+            status.set_status(hd, "plan.md", plan_status)
+        if verify is not None:
+            (hd / "verify.json").write_text(verify)
+        return hd
+
+    def _sweep(self, root: Path, *extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [PYTHON, str(WF / "casper_cleanup.py"), "--sweep", str(root), *extra],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
+
+    def test_sweep_removes_resolved_and_verified_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hd = self._run_dir(root, "goal-archived")
+            run = self._sweep(root)
+            self.assertEqual(run.returncode, 0, run.stdout)
+            self.assertFalse(hd.exists(), run.stdout)
+            self.assertIn("removed", run.stdout)
+            self.assertIn("1 removed", run.stdout)
+            self.assertTrue(root.exists())  # ROOT itself is never touched
+
+    def test_sweep_refuses_unverified_child_and_leaves_it_on_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hd = self._run_dir(root, "goal-unverified", verify=None)
+            run = self._sweep(root)
+            self.assertEqual(run.returncode, 0, run.stdout)  # refusal is informational
+            self.assertTrue(hd.exists(), run.stdout)
+            self.assertIn("refused", run.stdout)
+            self.assertIn("1 refused", run.stdout)
+
+    def test_sweep_never_deletes_live_in_progress_lease_even_with_force(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = self._run_dir(root, "goal-live", claim=True)
+            run = self._sweep(root, "--force")
+            self.assertEqual(run.returncode, 0, run.stdout)
+            self.assertTrue(live.exists(), run.stdout)
+            self.assertIn("skipped-live-lease", run.stdout)
+            self.assertIn("1 skipped-live-lease", run.stdout)
+            self.assertEqual(status._find(status._load_raw(live), "plan.md")["status"],
+                             "in_progress")
+
+    def test_sweep_force_removes_unverified_but_not_the_live_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = self._run_dir(root, "goal-live", claim=True)
+            junk = self._run_dir(root, "goal-superseded", plan_status="failed", verify=None)
+            run = self._sweep(root, "--force")
+            self.assertEqual(run.returncode, 0, run.stdout)
+            self.assertTrue(live.exists(), run.stdout)
+            self.assertFalse(junk.exists(), run.stdout)
+
+    def test_sweep_dry_run_deletes_nothing_and_reports_the_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hd = self._run_dir(root, "goal-done")
+            run = self._sweep(root, "--dry-run")
+            self.assertEqual(run.returncode, 0, run.stdout)
+            self.assertTrue(hd.exists(), run.stdout)
+            self.assertIn("would-remove", run.stdout)
+            self.assertIn("1 would-remove", run.stdout)
+            self.assertIn("0 bytes reclaimed", run.stdout)
+
+    def test_sweep_min_age_days_skips_a_freshly_touched_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fresh = self._run_dir(root, "goal-fresh")
+            (fresh / "notes.md").write_text("just now\n")
+            run = self._sweep(root, "--min-age-days", "1")
+            self.assertEqual(run.returncode, 0, run.stdout)
+            self.assertTrue(fresh.exists(), run.stdout)
+            self.assertIn("skipped-too-new", run.stdout)
+            self.assertIn("1 skipped-too-new", run.stdout)
+            # aged past the threshold, the same child is reaped
+            old = time.time() - 5 * 86400
+            for path in [fresh, *fresh.rglob("*")]:
+                os.utime(path, (old, old))
+            run = self._sweep(root, "--min-age-days", "1")
+            self.assertEqual(run.returncode, 0, run.stdout)
+            self.assertFalse(fresh.exists(), run.stdout)
+
+    def test_sweep_refuses_child_without_goal_md(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stranger = self._run_dir(root, "not-a-run", goal=False)
+            run = self._sweep(root, "--force")
+            self.assertEqual(run.returncode, 0, run.stdout)
+            self.assertTrue(stranger.exists(), run.stdout)
+            self.assertIn("no goal.md", run.stdout)
+            self.assertIn("1 refused", run.stdout)
+
+    def test_sweep_ignores_files_and_does_not_recurse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "loose.txt").write_text("not a dir\n")
+            nested = self._run_dir(root, "outer/inner")
+            run = self._sweep(root, "--force")
+            self.assertEqual(run.returncode, 0, run.stdout)
+            self.assertTrue((root / "loose.txt").exists())
+            self.assertTrue(nested.exists(), run.stdout)  # depth 2 is out of scope
+            self.assertIn("refused", run.stdout)  # outer/ has no goal.md
+
+    def test_sweep_and_handover_dir_are_mutually_exclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = subprocess.run(
+                [PYTHON, str(WF / "casper_cleanup.py"), "--sweep", tmp,
+                 "--handover-dir", tmp],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+            )
+            self.assertEqual(run.returncode, 2, run.stdout)
+            run = subprocess.run(
+                [PYTHON, str(WF / "casper_cleanup.py")],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+            )
+            self.assertEqual(run.returncode, 2, run.stdout)
 
 
 if __name__ == "__main__":

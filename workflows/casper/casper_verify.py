@@ -242,6 +242,7 @@ def _json_array(text: str) -> list[dict]:
 def run_judgments(
     checks: list[tuple[int, Check]], handover_dir: Path, harness: Path,
     model: str | None, effort: str | None, stopwatch: int, evidence_chars: int,
+    backend: str = "auto",
 ) -> dict[int, dict]:
     payload = [{"index": index, "criterion": check.criterion, "instruction": check.body}
                for index, check in checks]
@@ -257,6 +258,10 @@ def run_judgments(
         cmd += ["-m", model]
     if effort:
         cmd += ["-t", effort]
+    # Only a non-default backend is forwarded: "auto" IS the harness default, so
+    # omitting it keeps the judgment command line unchanged for existing callers.
+    if backend and backend != "auto":
+        cmd += ["--backend", backend]
     cmd += ["-s", str(stopwatch), "--", prompt]
     try:
         run = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -299,6 +304,9 @@ def main() -> int:
     ap.add_argument("--harness", type=Path, default=DEFAULT_HARNESS)
     ap.add_argument("--model", default=None)
     ap.add_argument("--effort", default=None)
+    ap.add_argument("--backend", choices=("auto", "pi", "claude"), default="auto",
+                    help="Backend for the batched judgment call, forwarded to "
+                         "LLM_harness.sh (auto: the harness's model/driver rule)")
     ap.add_argument("--judgment-stopwatch", type=int, default=1800)
     args = ap.parse_args()
 
@@ -319,7 +327,7 @@ def main() -> int:
         if judgments:
             for index, result in run_judgments(
                 judgments, hd, args.harness, args.model, args.effort,
-                args.judgment_stopwatch, args.evidence_chars,
+                args.judgment_stopwatch, args.evidence_chars, args.backend,
             ).items():
                 results[index] = result
         final = [result for result in results if result is not None]

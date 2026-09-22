@@ -6,13 +6,19 @@ file the planner emits as a manifest, augmented in place with status + lease so 
 headless LLM (or a fresh session) can tell what is resolved and resume only the rest.
 
 Entry shape:
-  {"file","title","wave","model","effort","status","lease","updated_at",
-   "session","pause_reason","zero_progress"}
+  {"file","title","wave","model","effort","backend","status","lease","updated_at",
+   "session","session_backend","pause_reason","zero_progress"}
   status        : pending | in_progress | done | paused | failed
   lease         : null | {"pid","host","started_at"(epoch),"stale_secs"} (in_progress owner)
-  session       : null | claude session id recorded on a warm-resumable pause; the next
-                  dispatch re-enters that session (claude -p --resume) instead of a cold start
-  pause_reason  : null | token | time | signal | child-exit (why the last run paused)
+  backend       : null | auto | pi | claude (optional per-plan backend for fanout)
+  session       : null | session id recorded on a warm-resumable pause; the next dispatch
+                  re-enters that session (claude -p --resume / pi --session) instead of a
+                  cold start
+  session_backend : null | claude | pi — which CLI minted `session`. A claude session id and
+                  a pi session id are not interchangeable, so a dispatch only warm-resumes a
+                  session tagged with the backend it is about to run; anything else (including
+                  a legacy untagged entry) cold-starts. Written/cleared with `session`.
+  pause_reason  : null | token | time | signal | child-exit | provider-limit (why the last run paused)
   zero_progress : consecutive runs the token budget killed on the very first model call
                   (plan input may not fit the budget); fanout flags NEEDS-USER at the limit
 
@@ -116,10 +122,14 @@ def _normalize(entry: dict) -> dict:
         "wave": int(entry.get("wave", 0) or 0),
         "model": entry.get("model"),
         "effort": entry.get("effort"),
+        "backend": entry.get("backend"),
         "status": entry.get("status") or "pending",
         "lease": entry.get("lease"),
         "updated_at": entry.get("updated_at") or _now_iso(),
         "session": entry.get("session"),
+        # Provenance travels with the id it describes: a re-init from a manifest
+        # that carries neither drops both, so no untagged id can be resumed.
+        "session_backend": entry.get("session_backend"),
         "pause_reason": entry.get("pause_reason"),
         "zero_progress": int(entry.get("zero_progress") or 0),
     }
@@ -349,7 +359,15 @@ _KEEP = object()  # sentinel: "leave the recorded session fields untouched"
 
 
 def set_status(handover_dir: Path, plan_file: str, status: str,
-               session=_KEEP, pause_reason=_KEEP, zero_progress=_KEEP) -> str:
+               session=_KEEP, pause_reason=_KEEP, zero_progress=_KEEP,
+               session_backend=_KEEP) -> str:
+    """Set a plan's status; on a pause, record the session and its provenance.
+
+    `session_backend` is the CLI that minted `session` ("claude" | "pi" | None).
+    It is additive and optional: omitting it preserves whatever is recorded, so
+    callers that only pause a plan (e.g. the pre-dispatch NEEDS-USER path) never
+    strip provenance from a still-resumable session.
+    """
     if status not in STATUSES:
         raise ValueError(f"status must be one of {STATUSES}")
     handover_dir = Path(handover_dir)
@@ -367,12 +385,15 @@ def set_status(handover_dir: Path, plan_file: str, status: str,
             # a later answered re-dispatch can still warm-resume it.
             if session is not _KEEP:
                 e["session"] = session
+            if session_backend is not _KEEP:
+                e["session_backend"] = session_backend
             if pause_reason is not _KEEP:
                 e["pause_reason"] = pause_reason
             if zero_progress is not _KEEP:
                 e["zero_progress"] = int(zero_progress)
         else:
             e["session"] = None  # any other transition invalidates the recorded session
+            e["session_backend"] = None
             e["pause_reason"] = None
             e["zero_progress"] = 0
         e["updated_at"] = _now_iso()

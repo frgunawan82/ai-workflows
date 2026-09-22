@@ -18,10 +18,12 @@ stopwatch (delivered at the next turn boundary; self-contained, mirrors
 casper_guard's notice), the stopwatch sends a clean `abort` (10s to settle,
 then the tree is killed — a child that never spoke rpc is killed immediately),
 extension UI dialogs are answered `cancelled` (matching `pi -p`'s headless
-"blocks outright" behavior, and avoiding hangs on timeout-less dialogs), and
-stdout becomes the FINAL assistant message text (what casper_verify.py wants;
-raw events would be noise). Exit: 0 settled, 1 settled with stopReason
-"error", 124 for every guard stop, child's code if it dies before settling.
+"blocks outright" behavior, and avoiding hangs on timeout-less dialogs), a
+prompt the rpc layer *rejects* (failed preflight, e.g. missing credentials)
+fails fast instead of idling to the stopwatch, and stdout becomes the FINAL
+assistant message text (what casper_verify.py wants; raw events would be
+noise). Exit: 0 settled, 1 settled with stopReason "error" or a rejected
+prompt, 124 for every guard stop, child's code if it dies before settling.
 
 Liveness signals, polled every --poll-secs:
   - CPU-time growth across the child's process tree (/proc/<pid>/stat),
@@ -127,15 +129,24 @@ def tree_stats(pids: list[int]) -> tuple[float, int]:
 
 def newest_session_mtime(session_root: Path, needle: str,
                          watch_dirs: tuple[Path, ...] = ()) -> float:
-    """Newest *.jsonl mtime across the agent session trees and extra watch dirs.
+    """Newest *.jsonl mtime for THIS run: the dedicated watch dirs when given,
+    otherwise the needle-filtered shared agent trees.
 
-    The needle (cwd slug) filters the shared agent trees to this run's sessions;
-    watch dirs are dedicated (e.g. a fanout --pi-session-dir), so every write
-    there counts.
+    A watch dir (a fanout --pi-session-dir) is dedicated to this resolver, so it
+    is the only trustworthy activity signal and must not be unioned with the
+    shared trees. The needle is only `basename(cwd)` -- the worktree name -- so
+    the shared trees also match every unrelated session sharing that basename
+    (the driving session, its subagents). Unioning them let those writes reset
+    the stall timer continuously and blinded the watchdog: a wedged resolver was
+    never TERMed at --stall-secs and instead burned its whole --stopwatch.
+    The shared-tree scan therefore stays a fallback for standalone runs only.
     """
     latest = 0.0
-    scans = [(session_root / sub, needle) for sub in ("sessions", "subagent-sessions")]
-    scans += [(Path(d), "") for d in watch_dirs]
+    if watch_dirs:
+        scans = [(Path(d), "") for d in watch_dirs]
+    else:
+        scans = [(session_root / sub, needle)
+                 for sub in ("sessions", "subagent-sessions")]
     for base, filt in scans:
         if not base.is_dir():
             continue
@@ -191,6 +202,8 @@ def wedged_pi_leaves(root: int) -> list[int]:
 
 
 _ABORT_GRACE = 10.0  # seconds a live rpc agent gets to settle after `abort`
+_REJECT_GRACE = 5.0  # seconds a rejected-prompt child gets to exit on SIGTERM
+_REJECT_DETAIL_MAX = 500  # stderr bound for pi's rejection message
 
 
 def _rpc_send(child: subprocess.Popen, obj: dict) -> bool:
@@ -201,6 +214,24 @@ def _rpc_send(child: subprocess.Popen, obj: dict) -> bool:
         return True
     except (OSError, ValueError):
         return False
+
+
+def _reject_detail(ev: dict) -> str:
+    """One bounded stderr line from a failed rpc response payload.
+
+    The payload is whatever pi sent, so it may be missing, empty or not even a
+    string; it is never inspected for meaning, only collapsed to a single line
+    and truncated so a verbose provider error cannot flood the plan log.
+    """
+    detail = ev.get("error")
+    if not isinstance(detail, str):
+        detail = "" if detail is None else repr(detail)
+    detail = " ".join(detail.split())
+    if not detail:
+        return "no error detail in the rpc response"
+    if len(detail) > _REJECT_DETAIL_MAX:
+        return detail[:_REJECT_DETAIL_MAX] + "..."
+    return detail
 
 
 def _assistant_text(message: dict) -> str:
@@ -315,6 +346,20 @@ def rpc_supervise(args: argparse.Namespace, cmd: list[str]) -> int:
                         stop_reason = message.get("stopReason") or stop_reason
                 elif kind == "agent_settled":
                     settled = True
+                elif (kind == "response" and ev.get("command") == "prompt"
+                        and ev.get("success") is False and aborted_at is None):
+                    # pi's rpc layer answers a rejected prompt (failed
+                    # preflight: bad/missing credentials, unusable model) with
+                    # one failure response and then stays silent forever. That
+                    # line is not liveness: nothing else will ever arrive, so
+                    # idling would burn the whole stopwatch and report a *pause*
+                    # that fanout redispatches. Scope: only the prompt command
+                    # (a failed steer/abort keeps its own path) and only before
+                    # an abort (a late rejection during wind-down is still a
+                    # budget stop -> 124).
+                    log(f"pi rejected the prompt: {_reject_detail(ev)}")
+                    term_then_kill(tree_pids(child.pid), wait_secs=_REJECT_GRACE)
+                    return finish(1)  # 1 -> fanout records `failed`, not paused
 
         now = time.monotonic()
         if settled:

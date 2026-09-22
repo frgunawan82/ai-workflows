@@ -4,15 +4,31 @@
 #
 # Usage:
 #   LLM_harness.sh [-m|--model MODEL] [-t|--thinking EFFORT] [-s|--stopwatch SECONDS]
+#                  [--backend auto|pi|claude]
 #                  [--grace SECONDS] [--max-context-tokens N] [--context-grace N]
 #                  [--resume-session ID] [--state-file PATH] [--pi-stall-secs N]
 #                  [--pi-session-id ID] [--pi-session-dir DIR]
 #                  [-n|--dry-run] [--list-models] [--default-model] [--] PROMPT
 #
-# Routing (MODEL is an alias or a full id; `--list-models` prints the menu):
-#   unqualified lowercase MODEL matching ^claude -> claude  (EFFORT -> --effort)
-#   bare non-Claude MODEL                        -> pi --provider openai
-#   provider/id MODEL                            -> pi --model provider/id
+# Routing (MODEL is an alias or a full id; `--list-models` prints the menu).
+# --backend picks the CLI independently of the model, effort and profile:
+#   auto (default) — the historical model/driver rule:
+#     unqualified lowercase MODEL matching ^claude -> claude  (EFFORT -> --effort)
+#       ...except under a pi driver (PI_CODING_AGENT set): qualified as
+#       anthropic/MODEL and routed through pi, so the call runs on the driver's
+#       own credentials ($PI_CODING_AGENT_DIR/auth.json — the pi-<profile> that
+#       launched the driver) instead of the Claude CLI's separately logged-in
+#       default profile.
+#     bare non-Claude MODEL                        -> pi --provider openai
+#     provider/id MODEL                            -> pi --model provider/id
+#   pi     — pi even outside a driver: bare ^claude MODEL -> anthropic/MODEL,
+#            bare non-Claude MODEL -> --provider openai, provider/id untouched.
+#   claude — the Claude CLI regardless of PI_CODING_AGENT, on its OWN auth
+#            context ($CLAUDE_CONFIG_DIR, default ~/.claude; no pi profile is
+#            read or mapped). Accepts an unqualified lowercase claude* id
+#            (aliases resolved) and anthropic/claude* (same models, prefix
+#            dropped); any other model — including another provider's — is a
+#            usage error (exit 2), never a silent model or provider switch.
 # Pi receives EFFORT unchanged via --thinking (off through max).
 # Guarded routes — claude with --max-context-tokens > 0 (casper_guard.py) and pi
 # unless --pi-stall-secs 0 (casper_pi_guard.py, driving `pi --mode rpc`) — inject a
@@ -27,8 +43,14 @@
 #           --model always wins; --model "" means auto; --default-model prints it.
 #           EFFORT=auto (GPT 5.6 Sol=high, all others=medium)
 #           STOPWATCH=7200  GRACE=300
+#           BACKEND=auto
 #           MAX-CONTEXT-TOKENS=0 (token guard off)  CONTEXT-GRACE=40000
 #           PI-STALL-SECS=900 (pi liveness guard; 0 disables)
+#
+# --max-context-tokens is the claude-only token guard: a nonzero value on a call
+# that resolves to the pi backend is a usage error (exit 2), not a silent drop —
+# pi has no token accounting here. Pass --backend claude to get the guard, or
+# --max-context-tokens 0 to run on pi without a cap.
 #
 # --resume-session/--state-file are claude guard-route extras (warm resume of a paused
 # resolver session and its sidecar for the dispatcher); ignored on the other routes.
@@ -46,6 +68,7 @@
 set -euo pipefail
 
 MODEL=""
+BACKEND="auto"
 EFFORT="medium"
 THINKING_EXPLICIT=0
 STOPWATCH="7200"
@@ -62,8 +85,8 @@ DRYRUN=0
 
 # Driver-aware default: casper dispatched by pi runs its resolvers on pi with the
 # driving session's own model; anywhere else the historical Claude default stands.
-# Requires BOTH PI_PROVIDER and PI_MODEL — composing PROVIDER/ID is what keeps a
-# claude-* PI_MODEL on the pi route (a bare claude-* id would hit the Claude CLI).
+# Requires BOTH PI_PROVIDER and PI_MODEL — composing PROVIDER/ID keeps the driver's
+# actual provider (a bare id would be re-qualified as anthropic/ by follow_driver).
 # casper_fanout.py mirrors this rule (_default_model); a parity test pins them.
 default_model() {
   if [ -n "${PI_CODING_AGENT:-}" ] && [ -n "${PI_PROVIDER:-}" ] && [ -n "${PI_MODEL:-}" ]; then
@@ -90,6 +113,49 @@ resolve_model() {
   esac
 }
 
+# Driver-aware routing: under a pi driver (PI_CODING_AGENT set — pi exports it into
+# every tool subprocess, and fanout/jobs/subagent all inherit that env) a bare
+# claude-* id is qualified as anthropic/<id> so it runs on pi with the driver's
+# own credentials: $PI_CODING_AGENT_DIR/auth.json, i.e. the pi-<profile> that
+# launched the driver. The Claude CLI reads $CLAUDE_CONFIG_DIR (default ~/.claude),
+# which no pi profile sets, so routing a bare id there would silently jump to the
+# default Claude account. Outside pi the Claude CLI route stands unchanged.
+# casper_fanout.py mirrors this rule (_is_claude_model); a parity test pins them.
+follow_driver() {
+  local m="$1"
+  if [ -n "${PI_CODING_AGENT:-}" ] && [[ "$m" != */* && "$m" =~ ^claude ]]; then
+    printf 'anthropic/%s\n' "$m"
+  else
+    printf '%s\n' "$m"
+  fi
+}
+
+# --backend pi: the same qualification the auto route applies under a driver, but
+# unconditionally — a bare claude-* id becomes anthropic/<id> (pi's own Anthropic
+# provider); an already provider-qualified id is NEVER re-qualified or stripped.
+qualify_pi() {
+  local m="$1"
+  if [[ "$m" != */* && "$m" =~ ^claude ]]; then
+    printf 'anthropic/%s\n' "$m"
+  else
+    printf '%s\n' "$m"
+  fi
+}
+
+# --backend claude: the Claude CLI only speaks Claude models. anthropic/claude*
+# names the very same models, so that one prefix is dropped; anything else
+# (other providers, non-Claude ids) fails in the caller with exit 2 rather than
+# being silently remapped. Returns 1 when the model is not acceptable.
+qualify_claude() {
+  local m="$1"
+  m="${m#anthropic/}"
+  if [[ "$m" != */* && "$m" =~ ^claude ]]; then
+    printf '%s\n' "$m"
+    return 0
+  fi
+  return 1
+}
+
 # Guard routes: locate this script's dir and the venv python, and demote the outer
 # stopwatch to a +60s failsafe — the guard owns the real stopwatch (and stays inside
 # fanout's 7800s lease). Sets HERE/GUARD_PY/TIMEOUT for the caller.
@@ -113,6 +179,11 @@ gpt-5.6-sol         gpt-5.6-sol                 pi --provider openai  (OPENAI_AP
 Aliases are case-insensitive; space or hyphen both work ("Fable 5", "sonnet-5").
 Anything else passes through: unqualified lowercase claude* -> claude;
 bare ids -> OpenAI via pi; provider/id values -> that provider via pi.
+Under a pi driver (PI_CODING_AGENT set) every unqualified claude* id, aliases
+included, becomes anthropic/<id> on pi — the driver's own pi profile credentials.
+--backend overrides that choice: --backend pi forces the pi route anywhere;
+--backend claude forces the Claude CLI (its own auth context) and accepts only
+claude* / anthropic/claude* models. --max-context-tokens works on claude only.
 EOF
 }
 
@@ -122,6 +193,7 @@ usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; }
 while [ $# -gt 0 ]; do
   case "$1" in
     -m|--model)      MODEL="${2?--model needs a value}"; shift 2 ;;  # empty = auto
+    --backend)       BACKEND="${2:?--backend needs a value}"; shift 2 ;;
     -t|--thinking)   EFFORT="${2:?--thinking needs a value}"; THINKING_EXPLICIT=1; shift 2 ;;
     -s|--stopwatch)  STOPWATCH="${2:?--stopwatch needs a value}"; shift 2 ;;
     --grace)         GRACE="${2:?--grace needs a value}"; shift 2 ;;
@@ -150,9 +222,44 @@ case "$GRACE" in ''|*[!0-9]*) echo "LLM_harness.sh: --grace must be integer seco
 case "$MAX_CTX" in ''|*[!0-9]*) echo "LLM_harness.sh: --max-context-tokens must be an integer" >&2; exit 2 ;; esac
 case "$CTX_GRACE" in ''|*[!0-9]*) echo "LLM_harness.sh: --context-grace must be an integer" >&2; exit 2 ;; esac
 case "$PI_STALL" in ''|*[!0-9]*) echo "LLM_harness.sh: --pi-stall-secs must be integer seconds" >&2; exit 2 ;; esac
+case "$BACKEND" in auto|pi|claude) ;; *) echo "LLM_harness.sh: --backend must be auto|pi|claude, got '$BACKEND'" >&2; exit 2 ;; esac
 
-[ -n "$MODEL" ] || MODEL="$(default_model)"
+MODEL_IS_DEFAULT=0
+if [ -z "$MODEL" ]; then MODEL="$(default_model)"; MODEL_IS_DEFAULT=1; fi
 MODEL="$(resolve_model "$MODEL")"
+
+# Backend selection is independent of model/effort/profile; the model is then
+# qualified for the CLI that will actually run it. BACKEND_EFF (never "auto") is
+# the single thing that picks the route, the guards and the session flags below.
+RAW_MODEL="$MODEL"
+case "$BACKEND" in
+  claude)
+    if ! MODEL="$(qualify_claude "$RAW_MODEL")"; then
+      SRC=""
+      [ "$MODEL_IS_DEFAULT" = 1 ] && SRC=" (the derived default model — this call passed no --model)"
+      echo "LLM_harness.sh: --backend claude cannot run model '$RAW_MODEL'$SRC." >&2
+      echo "  The Claude CLI takes claude* or anthropic/claude* ids only; pass one" >&2
+      echo "  explicitly (e.g. --model opus), or drop --backend claude to keep this model." >&2
+      exit 2
+    fi
+    BACKEND_EFF="claude" ;;
+  pi)
+    MODEL="$(qualify_pi "$RAW_MODEL")"
+    BACKEND_EFF="pi" ;;
+  *)
+    MODEL="$(follow_driver "$RAW_MODEL")"
+    if [[ "$MODEL" != */* && "$MODEL" =~ ^claude ]]; then BACKEND_EFF="claude"; else BACKEND_EFF="pi"; fi ;;
+esac
+
+# The token guard lives in casper_guard.py, which only drives the Claude CLI. An
+# explicit budget that the effective backend cannot honor is a usage error — never
+# a silently dropped cap. 0 (the default, "no cap") stays valid on both backends.
+if [ "$BACKEND_EFF" != "claude" ] && [ "$MAX_CTX" -gt 0 ]; then
+  echo "LLM_harness.sh: --max-context-tokens $MAX_CTX needs the claude backend, but this call" >&2
+  echo "  resolves to pi (--backend $BACKEND, model '$MODEL'); pi has no token guard here." >&2
+  echo "  Use --backend claude with a claude model, or --max-context-tokens 0." >&2
+  exit 2
+fi
 
 # Choose a model-aware default only when the caller did not supply --thinking.
 # Match the GPT model by basename so both bare and provider-qualified forms work.
@@ -166,7 +273,7 @@ fi
 # Hard wall-clock: SIGTERM at STOPWATCH, SIGKILL 10s later if it ignores TERM.
 TIMEOUT=(timeout --signal=TERM --kill-after=10 "${STOPWATCH}")
 
-if [[ "$MODEL" != */* && "$MODEL" =~ ^claude ]]; then
+if [ "$BACKEND_EFF" = "claude" ]; then
   if [ "$MAX_CTX" -gt 0 ]; then
     # Token-guard route: casper_guard.py owns the claude call, the real stopwatch,
     # the wind-down injection, and the token hard stop (exit 124).
@@ -179,7 +286,7 @@ if [[ "$MODEL" != */* && "$MODEL" =~ ^claude ]]; then
     if [ -n "$STATE_FILE" ]; then CMD+=(--state-file "$STATE_FILE"); fi
     CMD+=(-- "$PROMPT")
   else
-    # Legacy route (default): plain claude -p. Callers that parse this stdout as
+    # Unguarded route (default): plain claude -p. Callers that parse this stdout as
     # JSON (casper_verify.py judgments) rely on it staying byte-for-byte the
     # model's output — do not move them onto the guard route.
     # Wait indefinitely for backgrounded sub-work instead of the CLI's own ~600s
